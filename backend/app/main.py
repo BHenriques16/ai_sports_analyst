@@ -8,16 +8,14 @@ import uvicorn
 from fastapi import FastAPI, Depends
 from sqlalchemy.orm import Session
 from app.core.database import engine, Base, get_db
-from app.db.models import Player, PlayerGameStat
-from app.ingestion.nba_fetcher import sync_teams_and_players, fetch_player_gamelogs
-from app.stats.stats_engine import calculate_player_stats
+from app.db.models import Player, Team, PlayerGameStat, TeamGameStat
+from app.ingestion.nba_fetcher import sync_teams_and_players, fetch_player_gamelogs, fetch_team_gamelogs
+from app.stats.stats_engine import calculate_player_stats, calculate_team_stats
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="AI Sports Scout API")
 
-# Dicionário em memória para registar quando atualizámos cada jogador
-# Formato: {player_id: datetime_da_ultima_atualizacao}
 LAST_FETCHED = {}
 
 @app.post("/sync/rosters")
@@ -30,55 +28,90 @@ def get_all_players(db: Session = Depends(get_db)):
     players = db.query(Player.full_name).filter(Player.is_active == 1).order_by(Player.full_name).all()
     return [p[0] for p in players]
 
+@app.get("/teams")
+def get_all_teams(db: Session = Depends(get_db)):
+    teams = db.query(Team.full_name).order_by(Team.full_name).all()
+    return [t[0] for t in teams]
+
 @app.get("/player/{player_name}/stats")
 def get_player_stats(player_name: str, opponent: str = None, db: Session = Depends(get_db)):
     player = db.query(Player).filter(Player.full_name.ilike(f"%{player_name}%")).first()
     if not player:
-        return {"error": f"Jogador '{player_name}' não encontrado. Sincroniza as equipas."}
+        return {"error": f"Jogador '{player_name}' não encontrado."}
     
     stats = db.query(PlayerGameStat).filter(PlayerGameStat.player_id == player.id).all()
     
-    # --- LÓGICA DE ATUALIZAÇÃO INTELIGENTE (ON-DEMAND) ---
     needs_update = False
-    
     if not stats:
         needs_update = True
     else:
-        # Se já passaram mais de 6 horas desde a última vez que fomos à API, atualiza.
-        last_update = LAST_FETCHED.get(player.id)
+        last_update = LAST_FETCHED.get(f"P_{player.id}")
         if not last_update or datetime.now() - last_update > timedelta(hours=6):
             needs_update = True
             
     if needs_update:
-        print(f"A atualizar dados frescos na API para {player.full_name}...")
         try:
-            # Limpa os jogos antigos deste jogador na base de dados para evitar duplicados
             db.query(PlayerGameStat).filter(PlayerGameStat.player_id == player.id).delete()
             db.commit()
-            
-            # Vai buscar os dados atualizados incluindo os jogos de ontem à noite
             fetch_player_gamelogs(player.id, db)
-            
-            # Regista a hora exata da atualização para trancar a API nas próximas 6h
-            LAST_FETCHED[player.id] = datetime.now()
-            
-            # Volta a carregar os dados atualizados para a memória
+            LAST_FETCHED[f"P_{player.id}"] = datetime.now()
             stats = db.query(PlayerGameStat).filter(PlayerGameStat.player_id == player.id).all()
         except Exception as e:
-            print(f"Erro ao atualizar {player.full_name}: {e}")
             db.rollback()
             
     if not stats:
-        return {"error": "Não foram encontrados jogos para este jogador nesta época."}
+        return {"error": "Não foram encontrados jogos."}
         
-    processed_stats = calculate_player_stats(stats, target_opponent=opponent)
+    return {
+        "player_name": player.full_name,
+        "stats": calculate_player_stats(stats, target_opponent=opponent)
+    }
+
+@app.get("/team/{team_name}/stats")
+def get_team_stats(team_name: str, opponent: str = None, db: Session = Depends(get_db)):
+    team = db.query(Team).filter(Team.full_name.ilike(f"%{team_name}%")).first()
+    if not team:
+        return {"error": f"Equipa '{team_name}' não encontrada."}
+    
+    stats = db.query(TeamGameStat).filter(TeamGameStat.team_id == team.id).all()
+    
+    needs_update = False
+    if not stats:
+        needs_update = True
+    else:
+        last_update = LAST_FETCHED.get(f"T_{team.id}")
+        if not last_update or datetime.now() - last_update > timedelta(hours=6):
+            needs_update = True
+            
+    if needs_update:
+        try:
+            db.query(TeamGameStat).filter(TeamGameStat.team_id == team.id).delete()
+            db.commit()
+            fetch_team_gamelogs(team.id, db)
+            LAST_FETCHED[f"T_{team.id}"] = datetime.now()
+            stats = db.query(TeamGameStat).filter(TeamGameStat.team_id == team.id).all()
+        except Exception as e:
+            db.rollback()
+            
+    if not stats:
+        return {"error": "Não foram encontrados jogos para esta equipa."}
+        
+    # --- NOVO: Encontrar os pontos da equipa adversária cruzando o Game ID ---
+    game_ids = [g.game_id for g in stats]
+    opp_stats = db.query(TeamGameStat.game_id, TeamGameStat.pts).filter(
+        TeamGameStat.game_id.in_(game_ids),
+        TeamGameStat.team_id != team.id
+    ).all()
+    # Criamos um dicionário rápido {game_id: pontos_do_adversario}
+    opp_pts_map = {row.game_id: row.pts for row in opp_stats}
+        
+    processed_stats = calculate_team_stats(stats, opp_pts_map, target_opponent=opponent)
     
     if not processed_stats:
-        return {"error": f"Sem dados contra o adversário {opponent}."}
-    
+        return {"error": f"Sem dados H2H contra {opponent}."}
+        
     return {
-        "player_id": player.id,
-        "player_name": player.full_name,
+        "team_name": team.full_name,
         "stats": processed_stats
     }
 

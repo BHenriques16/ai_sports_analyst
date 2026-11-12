@@ -9,6 +9,8 @@ class Team(Base):
     abbreviation = Column(String)
     
     players = relationship("Player", back_populates="team")
+    # NOVA RELAÇÃO: Liga a equipa ao seu histórico de jogos coletivo
+    stats = relationship("TeamGameStat", back_populates="team") 
 
 class Player(Base):
     __tablename__ = "players"
@@ -28,7 +30,9 @@ class PlayerGameStat(Base):
     game_date = Column(Date, index=True)
     matchup = Column(String) # Ex: "BOS vs. LAL"
     
-    # Estatísticas
+    wl = Column(String) # NOVO: Necessário para saber se ganhou (W) ou perdeu (L)
+    
+    # Estatísticas Individuais
     minutes = Column(Float)
     pts = Column(Integer)
     reb = Column(Integer)
@@ -41,3 +45,30 @@ class PlayerGameStat(Base):
     fg3a = Column(Integer)
     
     player = relationship("Player", back_populates="stats")
+
+# ==========================================
+# NOVA TABELA: HISTÓRICO DE EQUIPAS (TEAM SCOUT)
+# ==========================================
+class TeamGameStat(Base):
+    __tablename__ = "team_game_stats"
+    id = Column(String, primary_key=True) # Ex: "TeamID_GameID"
+    team_id = Column(Integer, ForeignKey("teams.id"), index=True)
+    game_id = Column(String, index=True)
+    game_date = Column(Date, index=True)
+    matchup = Column(String) # Ex: "BOS vs. LAL"
+    
+    wl = Column(String) # Win/Loss (Para prever a Moneyline)
+    
+    # Estatísticas Coletivas (Totais de Equipa)
+    pts = Column(Integer)
+    reb = Column(Integer)
+    ast = Column(Integer)
+    stl = Column(Integer)
+    blk = Column(Integer)
+    fgm = Column(Integer)
+    fga = Column(Integer)
+    fg3m = Column(Integer)
+    fg3a = Column(Integer)
+    tov = Column(Integer) # Turnovers da equipa
+    
+    team = relationship("Team", back_populates="stats")
