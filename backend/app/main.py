@@ -1,5 +1,7 @@
 import sys
 import os
+from datetime import datetime, timedelta
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import uvicorn
@@ -13,6 +15,10 @@ from app.stats.stats_engine import calculate_player_stats
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="AI Sports Scout API")
+
+# Dicionário em memória para registar quando atualizámos cada jogador
+# Formato: {player_id: datetime_da_ultima_atualizacao}
+LAST_FETCHED = {}
 
 @app.post("/sync/rosters")
 def sync_rosters(db: Session = Depends(get_db)):
@@ -32,15 +38,39 @@ def get_player_stats(player_name: str, opponent: str = None, db: Session = Depen
     
     stats = db.query(PlayerGameStat).filter(PlayerGameStat.player_id == player.id).all()
     
+    # --- LÓGICA DE ATUALIZAÇÃO INTELIGENTE (ON-DEMAND) ---
+    needs_update = False
+    
     if not stats:
-        print(f"Sem dados para {player.full_name}. A descarregar da API...")
-        fetch_player_gamelogs(player.id, db)
-        stats = db.query(PlayerGameStat).filter(PlayerGameStat.player_id == player.id).all()
-        
+        needs_update = True
+    else:
+        # Se já passaram mais de 6 horas desde a última vez que fomos à API, atualiza.
+        last_update = LAST_FETCHED.get(player.id)
+        if not last_update or datetime.now() - last_update > timedelta(hours=6):
+            needs_update = True
+            
+    if needs_update:
+        print(f"A atualizar dados frescos na API para {player.full_name}...")
+        try:
+            # Limpa os jogos antigos deste jogador na base de dados para evitar duplicados
+            db.query(PlayerGameStat).filter(PlayerGameStat.player_id == player.id).delete()
+            db.commit()
+            
+            # Vai buscar os dados atualizados incluindo os jogos de ontem à noite
+            fetch_player_gamelogs(player.id, db)
+            
+            # Regista a hora exata da atualização para trancar a API nas próximas 6h
+            LAST_FETCHED[player.id] = datetime.now()
+            
+            # Volta a carregar os dados atualizados para a memória
+            stats = db.query(PlayerGameStat).filter(PlayerGameStat.player_id == player.id).all()
+        except Exception as e:
+            print(f"Erro ao atualizar {player.full_name}: {e}")
+            db.rollback()
+            
     if not stats:
         return {"error": "Não foram encontrados jogos para este jogador nesta época."}
         
-    # Passamos o target_opponent para filtrar apenas se o utilizador quiser
     processed_stats = calculate_player_stats(stats, target_opponent=opponent)
     
     if not processed_stats:
