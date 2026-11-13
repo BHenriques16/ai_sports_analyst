@@ -17,7 +17,7 @@ if st.sidebar.button("Sincronizar Equipas/Jogadores"):
 
 # --- FUNÇÕES DE LIGAÇÃO À API ---
 @st.cache_data(ttl=600)
-def fetch_player_names():
+def fetch_players_data():
     try:
         resp = requests.get(f"{API_URL}/players")
         return resp.json() if resp.status_code == 200 else []
@@ -46,21 +46,62 @@ def fetch_team_stats(name, opp=None):
         url += f"?opponent={opp}"
     return requests.get(url).json()
 
-player_names = fetch_player_names()
+@st.cache_data(ttl=60)
+def fetch_todays_games():
+    try:
+        resp = requests.get(f"{API_URL}/games/today")
+        return resp.json() if resp.status_code == 200 else []
+    except:
+        return []
+
+players_data = fetch_players_data()
+player_names = [p["name"] for p in players_data]
+player_team_map = {p["name"]: p["team"] for p in players_data}
+
+def format_player(name):
+    if not name: return None
+    team = player_team_map.get(name, 'FA')
+    return f"{name} ({team})"
+
 team_names = fetch_team_names()
 
 # --- SISTEMA DE NAVEGAÇÃO (TABS) ---
-tab1, tab2, tab3 = st.tabs([
-    "👤 Player Props (Estatísticas Individuais)", 
+tab_slate, tab1, tab2, tab3 = st.tabs([
+    "📅 Slate (Jogos Hoje)",
+    "👤 Player Props", 
     "🏟️ Team & Matchup Scout", 
-    "⚔️ Construtor de Combinações"
+    "⚔️ SGP (Same Game Parlays)"
 ])
+
+# ==========================================
+# TAB 0: SLATE (JOGOS DE HOJE)
+# ==========================================
+with tab_slate:
+    st.subheader("📅 Jogos da Noite")
+    
+    games = fetch_todays_games()
+    
+    if not games or "error" in games:
+        st.info("Sem jogos agendados para hoje ou a aguardar atualização da NBA.")
+    else:
+        cols = st.columns(3)
+        for i, g in enumerate(games):
+            with cols[i % 3].container(border=True):
+                st.markdown(f"#### {g['away_abrv']} @ {g['home_abrv']}")
+                if g['home_pts'] > 0 or g['away_pts'] > 0:
+                    st.markdown(f"{g['away_name']}: **{g['away_pts']}**")
+                    st.markdown(f"{g['home_name']}: **{g['home_pts']}**")
+                    st.success(f"🔥 {g['status']}")
+                else:
+                    st.markdown(f"{g['away_name']}")
+                    st.markdown(f"{g['home_name']}")
+                    st.caption(f"🕒 {g['status']}")
 
 # ==========================================
 # TAB 1: PLAYER PROPS
 # ==========================================
 with tab1:
-    search_name = st.selectbox("Pesquisa de Jogador", options=player_names, index=None, placeholder="Ex: Luka Doncic")
+    search_name = st.selectbox("Pesquisa de Jogador", options=player_names, format_func=format_player, index=None, placeholder="Ex: Luka Doncic")
 
     if search_name:
         with st.spinner(f"A obter dados de {search_name}..."):
@@ -76,11 +117,10 @@ with tab1:
             p_name = data["player_name"]
             stats = data["stats"]
             
-            st.header(f"{p_name}")
+            st.header(format_player(p_name))
             if opp_choice != "Todos":
                 st.caption(f"Histórico filtrado contra: **{opp_choice}**")
             
-            # Cabeçalho
             st.markdown("##### Médias e Eficiência (Regular Season)")
             h1, h2, h3, h4, h5, h6 = st.columns(6)
             h1.metric("PPG", stats["season_avg"].get("pts", 0))
@@ -92,7 +132,6 @@ with tab1:
             
             st.divider()
             
-            # Controlos Interativos
             st.markdown("### ⚙️ Análise de Tendências e Over/Under")
             ctrl1, ctrl2, ctrl3 = st.columns(3)
             
@@ -110,7 +149,6 @@ with tab1:
             default_line = float(stats["ou_analysis"][stat_key]["default_line"])
             ou_line = ctrl3.number_input("Linha de Over/Under", value=default_line, step=0.5)
             
-            # Dinâmica de Dados UI
             df = pd.DataFrame(stats["games_log"])
             
             if num_games_sel == "Todos":
@@ -125,7 +163,6 @@ with tab1:
             
             over_and_win = ((df_filtered[stat_key] > ou_line) & (df_filtered['wl'] == 'W')).sum() if 'wl' in df_filtered.columns else "N/A"
             
-            # Métricas Recentes
             st.markdown(f"**Performance: Amostra Selecionada ({len(df_filtered)} Jogos)**")
             col1, col2, col3, col4, col5 = st.columns(5)
             recent_avg = df_filtered[stat_key].mean()
@@ -135,7 +172,6 @@ with tab1:
             col4.metric("Volatilidade", round(std_dev, 1))
             col5.metric("Over + Vitória", f"{over_and_win} jogos")
             
-            # Gráfico Interativo
             df_chart = df_filtered.iloc[::-1].copy()
             bars = alt.Chart(df_chart).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
                 x=alt.X('game_date:T', title='Data', axis=alt.Axis(format='%d %b', labelAngle=-45)),
@@ -178,6 +214,8 @@ with tab2:
                 st.caption(f"Histórico filtrado apenas contra: **{opp_t_choice}**")
             
             st.markdown("##### Visão Geral (Regular Season)")
+            
+            # AGORA SEMPRE FIXO COM 4 COLUNAS!
             th1, th2, th3, th4 = st.columns(4)
             th1.metric("Win Rate (%)", f"{t_stats['season_avg'].get('win_rate', 0)}%")
             th2.metric("PPG (Pontos da Equipa)", round(t_stats['season_avg'].get('pts', 0), 1))
@@ -186,7 +224,6 @@ with tab2:
             
             st.divider()
 
-            # --- PAINEL H2H ---
             if opp_t_choice != "Todos":
                 st.markdown(f"### 🥊 Últimos Confrontos vs {opp_t_choice}")
                 h2h_df = pd.DataFrame(t_stats["games_log"])
@@ -254,71 +291,101 @@ with tab2:
                 st.dataframe(df_t_filtered[['game_date', 'matchup', 'wl', 'home_away', 'pts', 'opp_pts', 'total_pts', 'reb', 'ast', 'fg3m', 'tov']], use_container_width=True)
 
 # ==========================================
-# TAB 3: CONSTRUTOR DE COMBINAÇÕES
+# TAB 3: CONSTRUTOR SGP (SAME GAME PARLAYS)
 # ==========================================
 with tab3:
-    st.subheader("⚔️ Construtor de Combinações (Player Props)")
-    st.markdown("Cruza o histórico de dois jogadores para encontrar valor em apostas combinadas (Parlays/Duplas).")
+    st.subheader("⚔️ Construtor SGP (Same Game Parlays)")
+    st.markdown("Combina linhas de dois jogadores da **mesma equipa** no **mesmo jogo** para descobrir a taxa de acerto real e as Odds Justas da aposta combinada.")
     
     c1, c2 = st.columns(2)
-    p1_name = c1.selectbox("Jogador 1", options=player_names, index=None, key="combo_p1")
-    p2_name = c2.selectbox("Jogador 2", options=player_names, index=None, key="combo_p2")
+    p1_name = c1.selectbox("Jogador 1", options=player_names, format_func=format_player, index=None, key="sgp_p1")
+    
+    p1_team = player_team_map.get(p1_name) if p1_name else None
+    p2_options = [p for p in player_names if player_team_map.get(p) == p1_team and p != p1_name] if p1_team else []
+    
+    p2_name = c2.selectbox(
+        f"Jogador 2 {f'(Filtro: {p1_team})' if p1_team else ''}", 
+        options=p2_options, 
+        format_func=format_player, 
+        index=None, 
+        key="sgp_p2", 
+        disabled=not p1_name
+    )
     
     if p1_name and p2_name:
-        if p1_name == p2_name:
-            st.warning("Seleciona dois jogadores diferentes.")
+        with st.spinner("A cruzar os registos dos jogos em comum..."):
+            d1 = fetch_stats(p1_name)
+            d2 = fetch_stats(p2_name)
+            
+        if "error" in d1 or "error" in d2:
+            st.error("Erro ao carregar dados dos jogadores.")
         else:
-            with st.spinner("A processar estatísticas combinadas..."):
-                d1 = fetch_stats(p1_name)
-                d2 = fetch_stats(p2_name)
+            st.markdown("### 🎯 Definir Aposta Combinada")
+            stat_map_combo = {"Pontos": "pts", "Ressaltos": "reb", "Assistências": "ast", "Triplos": "fg3m", "PRA": "pra"}
+            
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                st.markdown(f"**Mercado para {p1_name}**")
+                stat_c1 = st.selectbox("Estatística", list(stat_map_combo.keys()), key="sgp_s1", label_visibility="collapsed")
+                stat_k1 = stat_map_combo[stat_c1]
+                line_1 = st.number_input("Linha Over", value=15.5, step=0.5, key="sgp_l1")
                 
-            if "error" in d1 or "error" in d2:
-                st.error("Erro ao carregar dados de um dos jogadores.")
+            with cc2:
+                st.markdown(f"**Mercado para {p2_name}**")
+                stat_c2 = st.selectbox("Estatística", list(stat_map_combo.keys()), key="sgp_s2", label_visibility="collapsed")
+                stat_k2 = stat_map_combo[stat_c2]
+                line_2 = st.number_input("Linha Over", value=5.5, step=0.5, key="sgp_l2")
+            
+            num_games_sgp = st.selectbox("Amostra de Jogos em Comum", ["Todos", 10, 20, 30], index=1)
+            
+            df1 = pd.DataFrame(d1["stats"]["games_log"])
+            df2 = pd.DataFrame(d2["stats"]["games_log"])
+            
+            if "game_id" not in df1.columns or "game_id" not in df2.columns:
+                st.error("Erro: O backend não devolveu o ID do jogo. Garante que atualizaste o stats_engine.py!")
             else:
-                st.markdown("### 🎯 Definir Aposta Combinada")
+                df_merged = pd.merge(
+                    df1[['game_id', 'game_date', 'matchup', stat_k1]], 
+                    df2[['game_id', stat_k2]], 
+                    on="game_id", 
+                    suffixes=('_p1', '_p2')
+                )
+                df_merged = df_merged.sort_values(by="game_date", ascending=False)
                 
-                cc1, cc2, cc3 = st.columns(3)
-                stat_map_combo = {"Pontos": "pts", "Ressaltos": "reb", "Assistências": "ast", "Triplos": "fg3m", "PRA": "pra"}
+                if num_games_sgp != "Todos":
+                    df_merged = df_merged.head(int(num_games_sgp))
                 
-                stat_choice = cc1.selectbox("Mercado", list(stat_map_combo.keys()), key="combo_stat")
-                stat_key = stat_map_combo[stat_choice]
+                total_games = len(df_merged)
                 
-                num_games_combo_sel = cc2.selectbox("Amostra (Últimos X jogos)", ["Todos", 5, 10, 20, 30], index=1, key="combo_games")
-                
-                line_p1 = cc3.number_input(f"Linha para {p1_name}", value=20.5, step=0.5, key="combo_l1")
-                line_p2 = cc3.number_input(f"Linha para {p2_name}", value=20.5, step=0.5, key="combo_l2")
-                
-                df1 = pd.DataFrame(d1["stats"]["games_log"])
-                if num_games_combo_sel != "Todos":
-                    df1 = df1.head(int(num_games_combo_sel))
-                
-                overs1 = (df1[stat_key] > line_p1).sum()
-                hr1 = (overs1 / len(df1)) if len(df1) > 0 else 0
-                
-                df2 = pd.DataFrame(d2["stats"]["games_log"])
-                if num_games_combo_sel != "Todos":
-                    df2 = df2.head(int(num_games_combo_sel))
-                    
-                overs2 = (df2[stat_key] > line_p2).sum()
-                hr2 = (overs2 / len(df2)) if len(df2) > 0 else 0
-                
-                combined_hr = hr1 * hr2
-                combined_pct = combined_hr * 100
-                fair_odds = (1 / combined_hr) if combined_hr > 0 else 0
-                
-                st.divider()
-                
-                rc1, rc2, rc3 = st.columns(3)
-                
-                rc1.markdown(f"**{p1_name}**")
-                rc1.metric(f"Hit Rate (> {line_p1})", f"{(hr1*100):.1f}%", f"{overs1} em {len(df1)} jogos")
-                
-                rc2.markdown(f"**{p2_name}**")
-                rc2.metric(f"Hit Rate (> {line_p2})", f"{(hr2*100):.1f}%", f"{overs2} em {len(df2)} jogos")
-                
-                rc3.markdown("**Matemática da Combinada**")
-                rc3.metric("Probabilidade Real", f"{combined_pct:.1f}%")
-                if fair_odds > 0:
-                    rc3.metric("Odd Justa (Fair Value)", f"{fair_odds:.2f}")
+                if total_games == 0:
+                    st.warning("Não há histórico recente onde ambos os jogadores tenham jogado na mesma partida.")
                 else:
-                    rc3.metric("Odd Justa", "N/A")
+                    col_p1 = f"{stat_k1}_p1"
+                    col_p2 = f"{stat_k2}_p2"
+                    
+                    df_merged['Hit_P1'] = df_merged[col_p1] > line_1
+                    df_merged['Hit_P2'] = df_merged[col_p2] > line_2
+                    df_merged['SGP_Hit'] = df_merged['Hit_P1'] & df_merged['Hit_P2']
+                    
+                    hr1 = df_merged['Hit_P1'].mean()
+                    hr2 = df_merged['Hit_P2'].mean()
+                    sgp_hr = df_merged['SGP_Hit'].mean()
+                    fair_odds = 1 / sgp_hr if sgp_hr > 0 else 0
+                    
+                    st.divider()
+                    st.markdown("### 📊 Resultados do Same Game Parlay")
+                    
+                    rc1, rc2, rc3 = st.columns(3)
+                    rc1.metric(f"{p1_name} (> {line_1} {stat_c1})", f"{(hr1*100):.1f}%", f"{df_merged['Hit_P1'].sum()} / {total_games}")
+                    rc2.metric(f"{p2_name} (> {line_2} {stat_c2})", f"{(hr2*100):.1f}%", f"{df_merged['Hit_P2'].sum()} / {total_games}")
+                    
+                    rc3.info("**Combinada (Bateram JUNTOS)**")
+                    rc3.metric("Probabilidade Real", f"{(sgp_hr*100):.1f}%")
+                    rc3.metric("Odd Justa (Fair Value)", f"{fair_odds:.2f}" if fair_odds > 0 else "N/A")
+                    
+                    with st.expander("Ver Registo de Jogos (Apenas Jogos em Comum)"):
+                        st.dataframe(
+                            df_merged[['game_date', 'matchup', col_p1, col_p2, 'SGP_Hit']]
+                            .rename(columns={col_p1: f"{p1_name} ({stat_c1})", col_p2: f"{p2_name} ({stat_c2})", "SGP_Hit": "Combinada Bateu?"}),
+                            use_container_width=True
+                        )

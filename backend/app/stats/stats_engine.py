@@ -19,6 +19,7 @@ def calculate_player_stats(games, target_opponent=None):
         return None
     
     data = [{
+        "game_id": g.game_id,
         "game_date": g.game_date,
         "matchup": g.matchup,
         "wl": getattr(g, 'wl', 'U'), 
@@ -41,6 +42,19 @@ def calculate_player_stats(games, target_opponent=None):
     df_full['is_b2b'] = df_full['days_rest'] == 1
     df_full = df_full.sort_values(by="game_date", ascending=False)
     
+    # Calcular colunas combinadas no df_full para manter a linha base da época estável
+    df_full['home_away'] = df_full['matchup'].apply(lambda x: 'Home' if 'vs.' in str(x) else 'Away')
+    df_full['pra'] = df_full['pts'] + df_full['reb'] + df_full['ast']
+    df_full['pa'] = df_full['pts'] + df_full['ast']
+    df_full['pr'] = df_full['pts'] + df_full['reb']
+    df_full['ar'] = df_full['ast'] + df_full['reb']
+    df_full['bs'] = df_full['blk'] + df_full['stl']
+    
+    stats_cols = ['minutes', 'pts', 'reb', 'ast', 'stl', 'blk', 'fg3m', 'pra', 'pa', 'pr', 'ar', 'bs']
+    
+    # Média global da época (para fixar a linha sugerida de Over/Under mesmo em modo H2H)
+    full_season_avg = df_full[stats_cols].mean().fillna(0).round(1).to_dict()
+    
     df_full['opp_abrv'] = df_full['matchup'].apply(lambda x: str(x).split(' ')[-1] if pd.notnull(x) else "")
     df_full['opp_name'] = df_full['opp_abrv'].map(NBA_TEAMS_MAP).fillna(df_full['opp_abrv'])
     
@@ -53,15 +67,6 @@ def calculate_player_stats(games, target_opponent=None):
 
     if df.empty:
         return None
-
-    df['home_away'] = df['matchup'].apply(lambda x: 'Home' if 'vs.' in str(x) else 'Away')
-    df['pra'] = df['pts'] + df['reb'] + df['ast']
-    df['pa'] = df['pts'] + df['ast']
-    df['pr'] = df['pts'] + df['reb']
-    df['ar'] = df['ast'] + df['reb']
-    df['bs'] = df['blk'] + df['stl']
-    
-    stats_cols = ['minutes', 'pts', 'reb', 'ast', 'stl', 'blk', 'fg3m', 'pra', 'pa', 'pr', 'ar', 'bs']
     
     season_avg = df[stats_cols].mean().fillna(0).round(1).to_dict()
     last_10_avg = df.head(10)[stats_cols].mean().fillna(0).round(1).to_dict()
@@ -83,7 +88,8 @@ def calculate_player_stats(games, target_opponent=None):
     ou_cols = ['pts', 'reb', 'ast', 'stl', 'blk', 'fg3m', 'pra', 'pa', 'pr', 'ar', 'bs']
     ou_analysis = {}
     for col in ou_cols:
-        base_line = round(season_avg[col]) + 0.5 
+        # Usa full_season_avg para a linha base não ser distorcida ao filtrar por H2H
+        base_line = round(full_season_avg[col]) + 0.5 
         recent_10 = df.head(10)[col]
         overs = int((recent_10 > base_line).sum())
         
@@ -91,7 +97,7 @@ def calculate_player_stats(games, target_opponent=None):
             "default_line": base_line,
             "over_10g": overs,
             "under_10g": len(recent_10) - overs,
-            "hit_rate_10g": (overs / len(recent_10)) * 100 if len(recent_10) > 0 else 0
+            "hit_rate_10g": round((overs / len(recent_10)) * 100, 1) if len(recent_10) > 0 else 0
         }
     
     df['game_date'] = df['game_date'].dt.strftime('%Y-%m-%d')
@@ -107,7 +113,6 @@ def calculate_player_stats(games, target_opponent=None):
         "games_log": df.to_dict(orient="records")
     }
 
-# --- NOVO: Aceita o mapa de pontos do adversário (opp_pts_map) ---
 def calculate_team_stats(games, opp_pts_map=None, target_opponent=None):
     if not games:
         return None
@@ -121,7 +126,7 @@ def calculate_team_stats(games, opp_pts_map=None, target_opponent=None):
         "matchup": g.matchup,
         "wl": getattr(g, 'wl', 'U'),
         "pts": g.pts,
-        "opp_pts": opp_pts_map.get(g.game_id, 0), # Vai buscar os pontos sofridos
+        "opp_pts": opp_pts_map.get(g.game_id, 0),
         "reb": g.reb,
         "ast": g.ast,
         "stl": g.stl,
@@ -134,7 +139,7 @@ def calculate_team_stats(games, opp_pts_map=None, target_opponent=None):
     df_full['game_date'] = pd.to_datetime(df_full['game_date'])
     df_full = df_full.sort_values(by="game_date", ascending=False)
     
-    # Calcular Totais do Jogo
+    df_full['opp_pts'] = df_full['opp_pts'].replace(0, np.nan)
     df_full['total_pts'] = df_full['pts'] + df_full['opp_pts']
     
     df_full['opp_abrv'] = df_full['matchup'].apply(lambda x: str(x).split(' ')[-1] if pd.notnull(x) else "")
@@ -174,6 +179,7 @@ def calculate_team_stats(games, opp_pts_map=None, target_opponent=None):
     }
     
     df['game_date'] = df['game_date'].dt.strftime('%Y-%m-%d')
+    df = df.fillna(0) 
     
     return {
         "unique_opponents": unique_opponents,
