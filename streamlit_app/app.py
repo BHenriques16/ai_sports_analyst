@@ -8,6 +8,15 @@ API_URL = "http://localhost:8000"
 st.set_page_config(page_title="AI Sports Scout", layout="wide")
 st.title("🏀 AI Sports Scout")
 
+# --- SISTEMA DE LEITURA DE HIPERLIGAÇÕES DO CHAT ---
+# Quando clicas num link gerado no chat, o Streamlit recarrega e apanha o parâmetro do URL
+query_player = st.query_params.get("player")
+if "active_player" not in st.session_state:
+    st.session_state.active_player = query_player
+elif query_player and query_player != st.session_state.active_player:
+    # Atualiza a memória se clicares num link de um jogador diferente
+    st.session_state.active_player = query_player
+
 st.sidebar.header("Administração")
 if st.sidebar.button("Sincronizar Equipas/Jogadores"):
     with st.spinner("A sincronizar base de dados..."):
@@ -15,7 +24,6 @@ if st.sidebar.button("Sincronizar Equipas/Jogadores"):
         st.sidebar.success(resp.json()["message"])
         st.cache_data.clear()
 
-# --- FUNÇÕES DE LIGAÇÃO À API ---
 @st.cache_data(ttl=600)
 def fetch_players_data():
     try:
@@ -54,6 +62,14 @@ def fetch_todays_games():
     except:
         return []
 
+@st.cache_data(ttl=300)
+def fetch_golden_nuggets():
+    try:
+        resp = requests.get(f"{API_URL}/scout/nuggets")
+        return resp.json().get("nuggets", []) if resp.status_code == 200 else []
+    except:
+        return []
+
 players_data = fetch_players_data()
 player_names = [p["name"] for p in players_data]
 player_team_map = {p["name"]: p["team"] for p in players_data}
@@ -65,12 +81,13 @@ def format_player(name):
 
 team_names = fetch_team_names()
 
-# --- SISTEMA DE NAVEGAÇÃO (TABS) ---
-tab_slate, tab1, tab2, tab3 = st.tabs([
+# --- SISTEMA DE NAVEGAÇÃO (5 TABS) ---
+tab_slate, tab1, tab2, tab3, tab4 = st.tabs([
     "📅 Slate (Jogos Hoje)",
     "👤 Player Props", 
     "🏟️ Team & Matchup Scout", 
-    "⚔️ SGP (Same Game Parlays)"
+    "⚔️ SGP (Same Game Parlays)",
+    "💬 AI Assistant"
 ])
 
 # ==========================================
@@ -98,12 +115,25 @@ with tab_slate:
                     st.caption(f"🕒 {g['status']}")
 
 # ==========================================
-# TAB 1: PLAYER PROPS
+# TAB 1: PLAYER PROPS (Com integração do link)
 # ==========================================
 with tab1:
-    search_name = st.selectbox("Pesquisa de Jogador", options=player_names, format_func=format_player, index=None, placeholder="Ex: Luka Doncic")
+    # Define o jogador carregado na caixa de pesquisa através da hiperligação
+    default_idx = None
+    if st.session_state.active_player in player_names:
+        default_idx = player_names.index(st.session_state.active_player)
+
+    search_name = st.selectbox(
+        "Pesquisa de Jogador", 
+        options=player_names, 
+        format_func=format_player, 
+        index=default_idx, 
+        placeholder="Ex: Luka Doncic"
+    )
 
     if search_name:
+        st.session_state.active_player = search_name
+        
         with st.spinner(f"A obter dados de {search_name}..."):
             full_data = fetch_stats(search_name)
             
@@ -133,21 +163,23 @@ with tab1:
             st.divider()
             
             st.markdown("### ⚙️ Análise de Tendências e Over/Under")
-            ctrl1, ctrl2, ctrl3 = st.columns(3)
+            ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
             
             stat_map = {
                 "Pontos": "pts", "Ressaltos": "reb", "Assistências": "ast", "Triplos Marcados": "fg3m", 
-                "Roubos": "stl", "Desarmes": "blk", "Pts+Reb+Ast (PRA)": "pra", "Pts+Ast (PA)": "pa", 
-                "Pts+Reb (PR)": "pr", "Ast+Reb (AR)": "ar", "Roubos+Desarmes (Stocks)": "bs"
+                "Pts+Reb+Ast (PRA)": "pra", "Pts+Ast (PA)": "pa", 
+                "Pts+Reb (PR)": "pr", "Ast+Reb (AR)": "ar"
             }
             
             stat_choice = ctrl1.selectbox("Estatística a analisar", list(stat_map.keys()))
             stat_key = stat_map[stat_choice]
             
-            num_games_sel = ctrl2.selectbox("Analisar últimos X jogos", ["Todos", 5, 10, 20, 30, 50], index=2)
+            num_games_sel = ctrl2.selectbox("Analisar últimos X jogos", ["Todos", 5, 10, 20, 30, 50], index=0)
+            
+            ou_direction = ctrl3.selectbox("Mercado (Over/Under)", ["Over", "Under"], index=0)
             
             default_line = float(stats["ou_analysis"][stat_key]["default_line"])
-            ou_line = ctrl3.number_input("Linha de Over/Under", value=default_line, step=0.5)
+            ou_line = ctrl4.number_input("Linha", value=default_line, step=0.5)
             
             df = pd.DataFrame(stats["games_log"])
             
@@ -156,27 +188,36 @@ with tab1:
             else:
                 df_filtered = df.head(int(num_games_sel)).copy()
                 
-            overs = (df_filtered[stat_key] > ou_line).sum()
-            hit_rate = (overs / len(df_filtered)) * 100 if len(df_filtered) > 0 else 0
+            if ou_direction == "Over":
+                hit_mask = df_filtered[stat_key] > ou_line
+                op_symbol = ">"
+                color_cond = alt.datum[stat_key] > ou_line
+            else:
+                hit_mask = df_filtered[stat_key] < ou_line
+                op_symbol = "<"
+                color_cond = alt.datum[stat_key] < ou_line
+                
+            hits = int(hit_mask.sum())
+            hit_rate = (hits / len(df_filtered)) * 100 if len(df_filtered) > 0 else 0
             badge = "🔥" if hit_rate >= 80 else "❄️" if hit_rate <= 30 else "📊"
             std_dev = df_filtered[stat_key].std()
             
-            over_and_win = ((df_filtered[stat_key] > ou_line) & (df_filtered['wl'] == 'W')).sum() if 'wl' in df_filtered.columns else "N/A"
+            hit_and_win = int((hit_mask & (df_filtered['wl'] == 'W')).sum()) if 'wl' in df_filtered.columns else "N/A"
             
             st.markdown(f"**Performance: Amostra Selecionada ({len(df_filtered)} Jogos)**")
             col1, col2, col3, col4, col5 = st.columns(5)
             recent_avg = df_filtered[stat_key].mean()
             col1.metric("Média", round(recent_avg, 1), round(recent_avg - stats["season_avg"].get(stat_key, 0), 1))
-            col2.metric(f"Overs (> {ou_line})", f"{overs} em {len(df_filtered)}")
+            col2.metric(f"{ou_direction}s ({op_symbol} {ou_line})", f"{hits} em {len(df_filtered)}")
             col3.metric(f"Taxa Acerto {badge}", f"{hit_rate:.1f}%")
-            col4.metric("Volatilidade", round(std_dev, 1))
-            col5.metric("Over + Vitória", f"{over_and_win} jogos")
+            col4.metric("Volatilidade", round(std_dev, 1) if pd.notna(std_dev) else 0)
+            col5.metric(f"{ou_direction} + Vitória", f"{hit_and_win} jogos")
             
             df_chart = df_filtered.iloc[::-1].copy()
             bars = alt.Chart(df_chart).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
                 x=alt.X('game_date:T', title='Data', axis=alt.Axis(format='%d %b', labelAngle=-45)),
                 y=alt.Y(f'{stat_key}:Q', title=stat_choice),
-                color=alt.condition(alt.datum[stat_key] > ou_line, alt.value('#10b981'), alt.value('#ef4444')),
+                color=alt.condition(color_cond, alt.value('#10b981'), alt.value('#ef4444')),
                 tooltip=[alt.Tooltip('game_date:T', title='Data'), alt.Tooltip('matchup:N', title='Jogo'), 
                          alt.Tooltip(f'{stat_key}:Q', title=stat_choice), alt.Tooltip('wl:N', title='Resultado (W/L)')]
             )
@@ -187,6 +228,31 @@ with tab1:
                 display_cols = ['game_date', 'matchup', 'wl', 'home_away', 'is_b2b', 'minutes', 'pts', 'reb', 'ast', 'fg3m', 'pra']
                 available_cols = [c for c in display_cols if c in df_filtered.columns]
                 st.dataframe(df_filtered[available_cols], use_container_width=True)
+
+            st.divider()
+            st.markdown("### 🤖 Gerar AI Scout Report")
+            st.caption(f"Usa o LLM local para interpretar as tendências de {p_name} face ao mercado **{ou_direction} {ou_line}** em {stat_choice}.")
+            
+            if st.button("🪄 Gerar Relatório", type="primary"):
+                with st.spinner("A IA está a analisar as estatísticas..."):
+                    payload = {
+                        "player_name": p_name,
+                        "stat_choice": stat_choice,
+                        "stat_key": stat_key,
+                        "ou_line": ou_line,
+                        "ou_direction": ou_direction,
+                        "stats_data": stats
+                    }
+                    try:
+                        ai_resp = requests.post(f"{API_URL}/ai/player-report", json=payload)
+                        if ai_resp.status_code == 200:
+                            report_text = ai_resp.json().get("report", "")
+                            with st.chat_message("ai"):
+                                st.markdown(report_text)
+                        else:
+                            st.error(f"Erro na API: {ai_resp.status_code}")
+                    except Exception as e:
+                        st.error(f"Falha de ligação ao backend: {e}")
 
 # ==========================================
 # TAB 2: TEAM & MATCHUP SCOUT
@@ -215,7 +281,6 @@ with tab2:
             
             st.markdown("##### Visão Geral (Regular Season)")
             
-            # AGORA SEMPRE FIXO COM 4 COLUNAS!
             th1, th2, th3, th4 = st.columns(4)
             th1.metric("Win Rate (%)", f"{t_stats['season_avg'].get('win_rate', 0)}%")
             th2.metric("PPG (Pontos da Equipa)", round(t_stats['season_avg'].get('pts', 0), 1))
@@ -269,7 +334,7 @@ with tab2:
             st.markdown("### 📊 Forma Recente (Pontos e Resultados)")
             df_t = pd.DataFrame(t_stats["games_log"])
             
-            num_t_games_sel = st.selectbox("Analisar últimos X jogos (Equipa)", ["Todos", 5, 10, 20, 30], index=1)
+            num_t_games_sel = st.selectbox("Analisar últimos X jogos (Equipa)", ["Todos", 5, 10, 20, 30], index=0)
             
             if num_t_games_sel == "Todos":
                 df_t_filtered = df_t.copy()
@@ -326,23 +391,27 @@ with tab3:
             cc1, cc2 = st.columns(2)
             with cc1:
                 st.markdown(f"**Mercado para {p1_name}**")
-                stat_c1 = st.selectbox("Estatística", list(stat_map_combo.keys()), key="sgp_s1", label_visibility="collapsed")
+                sc1_a, sc1_b, sc1_c = st.columns([2, 1.2, 1.5])
+                stat_c1 = sc1_a.selectbox("Estatística", list(stat_map_combo.keys()), key="sgp_s1")
                 stat_k1 = stat_map_combo[stat_c1]
-                line_1 = st.number_input("Linha Over", value=15.5, step=0.5, key="sgp_l1")
+                dir_1 = sc1_b.selectbox("O/U", ["Over", "Under"], key="sgp_d1")
+                line_1 = sc1_c.number_input("Linha", value=15.5, step=0.5, key="sgp_l1")
                 
             with cc2:
                 st.markdown(f"**Mercado para {p2_name}**")
-                stat_c2 = st.selectbox("Estatística", list(stat_map_combo.keys()), key="sgp_s2", label_visibility="collapsed")
+                sc2_a, sc2_b, sc2_c = st.columns([2, 1.2, 1.5])
+                stat_c2 = sc2_a.selectbox("Estatística", list(stat_map_combo.keys()), key="sgp_s2")
                 stat_k2 = stat_map_combo[stat_c2]
-                line_2 = st.number_input("Linha Over", value=5.5, step=0.5, key="sgp_l2")
+                dir_2 = sc2_b.selectbox("O/U", ["Over", "Under"], key="sgp_d2")
+                line_2 = sc2_c.number_input("Linha", value=5.5, step=0.5, key="sgp_l2")
             
-            num_games_sgp = st.selectbox("Amostra de Jogos em Comum", ["Todos", 10, 20, 30], index=1)
+            num_games_sgp = st.selectbox("Amostra de Jogos em Comum", ["Todos", 10, 20, 30], index=0)
             
             df1 = pd.DataFrame(d1["stats"]["games_log"])
             df2 = pd.DataFrame(d2["stats"]["games_log"])
             
             if "game_id" not in df1.columns or "game_id" not in df2.columns:
-                st.error("Erro: O backend não devolveu o ID do jogo. Garante que atualizaste o stats_engine.py!")
+                st.error("Erro: O backend não devolveu o ID do jogo.")
             else:
                 df_merged = pd.merge(
                     df1[['game_id', 'game_date', 'matchup', stat_k1]], 
@@ -363,9 +432,12 @@ with tab3:
                     col_p1 = f"{stat_k1}_p1"
                     col_p2 = f"{stat_k2}_p2"
                     
-                    df_merged['Hit_P1'] = df_merged[col_p1] > line_1
-                    df_merged['Hit_P2'] = df_merged[col_p2] > line_2
+                    df_merged['Hit_P1'] = (df_merged[col_p1] > line_1) if dir_1 == "Over" else (df_merged[col_p1] < line_1)
+                    df_merged['Hit_P2'] = (df_merged[col_p2] > line_2) if dir_2 == "Over" else (df_merged[col_p2] < line_2)
                     df_merged['SGP_Hit'] = df_merged['Hit_P1'] & df_merged['Hit_P2']
+                    
+                    op1 = ">" if dir_1 == "Over" else "<"
+                    op2 = ">" if dir_2 == "Over" else "<"
                     
                     hr1 = df_merged['Hit_P1'].mean()
                     hr2 = df_merged['Hit_P2'].mean()
@@ -376,8 +448,8 @@ with tab3:
                     st.markdown("### 📊 Resultados do Same Game Parlay")
                     
                     rc1, rc2, rc3 = st.columns(3)
-                    rc1.metric(f"{p1_name} (> {line_1} {stat_c1})", f"{(hr1*100):.1f}%", f"{df_merged['Hit_P1'].sum()} / {total_games}")
-                    rc2.metric(f"{p2_name} (> {line_2} {stat_c2})", f"{(hr2*100):.1f}%", f"{df_merged['Hit_P2'].sum()} / {total_games}")
+                    rc1.metric(f"{p1_name} ({dir_1} {op1} {line_1} {stat_c1})", f"{(hr1*100):.1f}%", f"{int(df_merged['Hit_P1'].sum())} / {total_games}")
+                    rc2.metric(f"{p2_name} ({dir_2} {op2} {line_2} {stat_c2})", f"{(hr2*100):.1f}%", f"{int(df_merged['Hit_P2'].sum())} / {total_games}")
                     
                     rc3.info("**Combinada (Bateram JUNTOS)**")
                     rc3.metric("Probabilidade Real", f"{(sgp_hr*100):.1f}%")
@@ -389,3 +461,78 @@ with tab3:
                             .rename(columns={col_p1: f"{p1_name} ({stat_c1})", col_p2: f"{p2_name} ({stat_c2})", "SGP_Hit": "Combinada Bateu?"}),
                             use_container_width=True
                         )
+
+# ==========================================
+# TAB 4: AI ASSISTANT
+# ==========================================
+with tab4:
+    st.subheader("💬 Assistente Virtual AI")
+    st.markdown("Conversa livremente com o teu assistente. Ele **já conhece os jogos agendados para hoje**!")
+    
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
+
+    st.markdown("⚡ **Sugestões Rápidas:**")
+    pc1, pc2, pc3, pc4, pc5 = st.columns(5)
+    
+    prompt_chip = None
+    if pc1.button("🔥 Analisar Alta Pontuação"):
+        prompt_chip = "Olhando para os jogos de hoje, qual achas que tem maior probabilidade de ser um jogo de alta pontuação (Over) e porquê?"
+    if pc2.button("🛡️ Procurar Defesas (Under)"):
+        prompt_chip = "Qual dos jogos de hoje tem mais cara de ser um jogo defensivo e de baixa pontuação (Under)?"
+    if pc3.button("⚔️ Sugerir SGP"):
+        prompt_chip = "Gera uma ideia lógica de Same Game Parlay (SGP) para um dos jogos de hoje, justificando a correlação entre os jogadores."
+    
+    # NOVO BOTÃO COM BYPASS DIRETO PARA O CHAT (Zero falhas, instantâneo e com links intocados!)
+    if pc4.button("💎 Sugestões do Dia (>75%)", type="primary"):
+        with st.spinner("O Python está a compilar as estatísticas da época..."):
+            nuggets = fetch_golden_nuggets()
+            if not nuggets:
+                st.warning("Não encontrei sugestões válidas ou a base de dados precisa de sincronização.")
+            else:
+                lista_pepitas = "\n".join(nuggets)
+                
+                # Cabeçalho amigável como se fosse o Assistente a falar
+                resposta_final = f"Aqui estão as melhores tendências estatísticas (>75%) para os jogos de hoje, processadas a 100% pelo sistema analítico.\nClica no nome de qualquer jogador a azul para abri-lo automaticamente na Tab de Player Props!\n\n{lista_pepitas}"
+                
+                # Injeta DIRETAMENTE no chat (Sem passar pelo Ollama, logo não há falhas nem limites de tokens)
+                st.session_state.chat_messages.append({"role": "assistant", "content": resposta_final})
+                st.rerun()
+
+    # BOTÃO DE LIMPEZA DE HISTÓRICO (Evita Timeouts no futuro)
+    if pc5.button("🧹 Limpar Chat"):
+        st.session_state.chat_messages = []
+        st.rerun()
+
+    st.divider()
+
+    chat_container = st.container(height=450)
+    with chat_container:
+        for msg in st.session_state.chat_messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+    user_input = st.chat_input("Pede uma análise, uma tip, ou explora uma equipa...")
+    
+    final_prompt = user_input or prompt_chip
+
+    if final_prompt:
+        st.session_state.chat_messages.append({"role": "user", "content": final_prompt})
+        with chat_container:
+            with st.chat_message("user"):
+                st.markdown(final_prompt)
+            
+            with st.chat_message("ai"):
+                with st.spinner("A analisar o calendário e as táticas..."):
+                    try:
+                        payload = {"messages": st.session_state.chat_messages}
+                        resp = requests.post(f"{API_URL}/ai/chat", json=payload)
+                        
+                        if resp.status_code == 200:
+                            ai_text = resp.json().get("response", "")
+                            st.markdown(ai_text)
+                            st.session_state.chat_messages.append({"role": "assistant", "content": ai_text})
+                        else:
+                            st.error(f"Erro na API: {resp.status_code}")
+                    except Exception as e:
+                        st.error(f"O backend está offline ou falhou: {e}")

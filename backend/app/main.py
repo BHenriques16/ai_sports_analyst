@@ -1,5 +1,6 @@
 import sys
 import os
+import urllib.parse
 from datetime import datetime, timedelta
 import pandas as pd
 
@@ -7,6 +8,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import uvicorn
 from fastapi import FastAPI, Depends
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.core.database import engine, Base, get_db
@@ -14,6 +16,7 @@ from app.db.models import Player, Team, PlayerGameStat, TeamGameStat
 from app.ingestion.nba_fetcher import sync_teams_and_players, fetch_player_gamelogs, fetch_team_gamelogs
 from app.stats.stats_engine import calculate_player_stats, calculate_team_stats
 from nba_api.stats.endpoints import scoreboardv2
+from app.ai.llm_scout import generate_player_report, chat_with_agent
 
 Base.metadata.create_all(bind=engine)
 
@@ -22,7 +25,6 @@ app = FastAPI(title="AI Sports Scout API")
 LAST_FETCHED = {}
 
 def should_update_entity(entity_key: str, latest_game_date, hours_cooldown: int = 6) -> bool:
-    """Verifica se é necessário ir à API da NBA com base na cache e na data do último jogo na BD."""
     now = datetime.now()
     last_fetch = LAST_FETCHED.get(entity_key)
     
@@ -32,7 +34,6 @@ def should_update_entity(entity_key: str, latest_game_date, hours_cooldown: int 
     if not latest_game_date:
         return True
         
-    # Se já temos o jogo de hoje ou de ontem na BD, marcamos como atualizado sem chamar a API
     if latest_game_date >= (now.date() - timedelta(days=1)):
         LAST_FETCHED[entity_key] = now
         return False
@@ -42,7 +43,6 @@ def should_update_entity(entity_key: str, latest_game_date, hours_cooldown: int 
 @app.post("/sync/rosters")
 def sync_rosters(db: Session = Depends(get_db)):
     sync_teams_and_players(db)
-    print("A atualizar de forma incremental os calendários das 30 equipas da NBA...")
     all_teams = db.query(Team).all()
     for t in all_teams:
         last_update = LAST_FETCHED.get(f"T_{t.id}")
@@ -181,6 +181,185 @@ def get_team_stats(team_name: str, opponent: str = None, db: Session = Depends(g
         "team_name": team.full_name,
         "stats": processed_stats
     }
+
+
+# ==========================================
+# ROTA: SCANNER DE SUGESTÕES DO DIA (Unders Fixos & Overs por Patamares)
+# ==========================================
+@app.get("/scout/nuggets")
+def get_golden_nuggets(db: Session = Depends(get_db)):
+    games = get_todays_games()
+    if isinstance(games, dict) and "error" in games:
+        return {"nuggets": []}
+        
+    team_to_game = {}
+    playing_abrvs = []
+    
+    for g in games:
+        game_title = f"{g['away_abrv']} @ {g['home_abrv']}"
+        team_to_game[g['away_abrv']] = game_title
+        team_to_game[g['home_abrv']] = game_title
+        playing_abrvs.extend([g['away_abrv'], g['home_abrv']])
+        
+    teams = db.query(Team).filter(Team.abbreviation.in_(playing_abrvs)).all()
+    team_id_to_abrv = {t.id: t.abbreviation for t in teams}
+    team_ids = list(team_id_to_abrv.keys())
+    
+    players = db.query(Player).filter(Player.team_id.in_(team_ids), Player.is_active == 1).all()
+    
+    game_nuggets = {team_to_game[abrv]: [] for abrv in playing_abrvs}
+    
+    target_stats = {
+        "pts": "Pontos", "reb": "Ressaltos", "ast": "Assistências", 
+        "pra": "Pontos + Ressaltos + Assistências", "pr": "Pontos + Ressaltos", 
+        "pa": "Pontos + Assistências", "ar": "Assistências + Ressaltos",
+        "fg3m": "Triplos Marcados"
+    }
+    
+    min_thresholds = {
+        "pts": 8.0, "reb": 3.5, "ast": 2.5, "pra": 15.0, 
+        "pr": 10.0, "pa": 10.0, "ar": 8.0, "fg3m": 2.2
+    }
+    
+    for p in players:
+        p_stats = db.query(PlayerGameStat).filter(PlayerGameStat.player_id == p.id).all()
+        if not p_stats or len(p_stats) < 10:
+            continue
+            
+        processed = calculate_player_stats(p_stats)
+        if not processed or "games_log" not in processed:
+            continue
+            
+        if processed["season_avg"].get("minutes", 0) < 20:
+            continue
+            
+        df = pd.DataFrame(processed["games_log"])
+        total_games = len(df)
+        
+        p_team_abrv = team_id_to_abrv.get(p.team_id)
+        if not p_team_abrv:
+            continue
+        game_title = team_to_game[p_team_abrv]
+        
+        for stat_key, stat_name in target_stats.items():
+            season_avg = processed["season_avg"].get(stat_key, 0)
+            
+            if season_avg < min_thresholds.get(stat_key, 0):
+                continue
+                
+            if stat_key not in processed.get("ou_analysis", {}):
+                continue
+            
+            link_url = f"/?player={urllib.parse.quote(p.full_name)}"
+            player_link_md = f"[{p.full_name}]({link_url})"
+            
+            default_line = float(processed["ou_analysis"][stat_key]["default_line"])
+            
+            # ==========================================
+            # 1. LOGICA DOS UNDERS (Sempre baseada na Média/Main Line)
+            # ==========================================
+            unders = int((df[stat_key] < default_line).sum())
+            under_rate = unders / total_games
+            if under_rate >= 0.75:
+                text = f"- 🔴 **{player_link_md}** ({p_team_abrv}) | {stat_name}: **UNDER {default_line}** *(Acertou {unders}/{total_games} → {under_rate*100:.1f}%)*"
+                game_nuggets[game_title].append((under_rate, text))
+
+            # ==========================================
+            # 2. LOGICA DOS OVERS (Patamares/Alternate Lines)
+            # ==========================================
+            over_lines_to_check = []
+            
+            if stat_key == "pts":
+                if season_avg >= 24.5: over_lines_to_check = [19.5, 24.5, 29.5]
+                elif season_avg >= 19.5: over_lines_to_check = [14.5, 19.5, 24.5]
+                elif season_avg >= 14.5: over_lines_to_check = [9.5, 14.5, 19.5]
+                elif season_avg >= 9.5: over_lines_to_check = [9.5, 14.5]
+            elif stat_key in ["reb", "ast"]:
+                if season_avg >= 10.5: over_lines_to_check = [8.5, 10.5, 12.5]
+                elif season_avg >= 8.5: over_lines_to_check = [6.5, 8.5, 10.5]
+                elif season_avg >= 6.5: over_lines_to_check = [4.5, 6.5, 8.5]
+                elif season_avg >= 4.5: over_lines_to_check = [2.5, 4.5, 6.5]
+                elif season_avg >= 2.5: over_lines_to_check = [2.5, 4.5]
+            else:
+                # Combinadas mantêm a default_line
+                over_lines_to_check = [default_line]
+                
+            valid_overs = []
+            best_over_rate = 0
+            
+            for line in over_lines_to_check:
+                overs = int((df[stat_key] > line).sum())
+                rate = overs / total_games
+                if rate >= 0.75:
+                    valid_overs.append(f"**OVER {line}** *({overs}/{total_games} → {rate*100:.1f}%)*")
+                    if rate > best_over_rate:
+                        best_over_rate = rate
+                        
+            if valid_overs:
+                tiers_str = " | ".join(valid_overs)
+                text = f"- 🟢 **{player_link_md}** ({p_team_abrv}) | {stat_name}: {tiers_str}"
+                game_nuggets[game_title].append((best_over_rate, text))
+                
+    # ==========================================
+    # FORMATAÇÃO VISUAL DIRETA PARA O CHAT
+    # ==========================================
+    final_nuggets = []
+    for game_title, nuggets_list in game_nuggets.items():
+        if nuggets_list:
+            nuggets_list.sort(key=lambda x: x[0], reverse=True)
+            top_10 = nuggets_list[:10]
+            
+            final_nuggets.append(f"\n### 🏀 {game_title}\n")
+            for _, text in top_10:
+                final_nuggets.append(text)
+                
+    return {"nuggets": final_nuggets}
+
+# ==========================================
+# ROTAS DE INTELIGÊNCIA ARTIFICIAL (OLLAMA)
+# ==========================================
+class AIReportRequest(BaseModel):
+    player_name: str
+    stat_choice: str
+    stat_key: str
+    ou_line: float
+    ou_direction: str = "Over"
+    stats_data: dict
+
+@app.post("/ai/player-report")
+def get_ai_player_report(req: AIReportRequest):
+    report = generate_player_report(
+        player_name=req.player_name,
+        stat_choice=req.stat_choice,
+        stat_key=req.stat_key,
+        ou_line=req.ou_line,
+        ou_direction=req.ou_direction,
+        stats_data=req.stats_data
+    )
+    return {"report": report}
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class AIChatRequest(BaseModel):
+    messages: list[ChatMessage]
+
+@app.post("/ai/chat")
+def ai_chat_endpoint(req: AIChatRequest):
+    slate_data = get_todays_games()
+    
+    slate_text = ""
+    if isinstance(slate_data, list) and len(slate_data) > 0:
+        for g in slate_data:
+            slate_text += f"- {g.get('away_name', 'Fora')} vs {g.get('home_name', 'Casa')} ({g.get('status', '')})\n"
+    else:
+        slate_text = "Não há jogos agendados para hoje ou houve um erro a carregar o calendário."
+        
+    messages_list = [{"role": m.role, "content": m.content} for m in req.messages]
+    
+    resposta = chat_with_agent(messages_list, slate_text)
+    return {"response": resposta}
 
 if __name__ == "__main__":
     uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=True)
